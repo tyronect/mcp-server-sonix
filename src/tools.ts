@@ -33,6 +33,8 @@ export function registerTools(server: McpServer, client: SonixClient) {
     {
       page: z
         .number()
+        .int()
+        .min(1)
         .optional()
         .describe("Page number (default: 1, 100 items per page)"),
       status: z
@@ -77,7 +79,7 @@ export function registerTools(server: McpServer, client: SonixClient) {
     "Submit a publicly accessible URL for transcription. Transcription happens asynchronously — use get_media to check status.",
     {
       file_url: z
-        .url()
+        .string()
         .describe("Publicly accessible URL of the audio/video file"),
       language: z
         .string()
@@ -95,7 +97,7 @@ export function registerTools(server: McpServer, client: SonixClient) {
         .optional()
         .describe("Comma-separated keywords to improve transcription accuracy"),
       callback_url: z
-        .url()
+        .string()
         .optional()
         .describe("Webhook URL to notify when transcription completes"),
     },
@@ -145,7 +147,7 @@ export function registerTools(server: McpServer, client: SonixClient) {
       query: z
         .string()
         .describe("Search query to filter media by name or content"),
-      page: z.number().optional().describe("Page number (default: 1)"),
+      page: z.number().int().min(1).optional().describe("Page number (default: 1)"),
       status: z.string().optional().describe("Filter by status"),
     },
     async ({ query, page, status }) => {

@@ -1,4 +1,12 @@
 const BASE_URL = "https://api.sonix.ai/v1";
+const REQUEST_TIMEOUT_MS = 30_000;
+
+const ACCEPT_HEADERS: Record<string, string> = {
+  text: "text/plain",
+  json: "application/json",
+  srt: "application/x-subrip",
+  vtt: "text/vtt",
+};
 
 export class SonixClient {
   private apiKey: string;
@@ -12,13 +20,16 @@ export class SonixClient {
     options: RequestInit = {}
   ): Promise<Response> {
     const url = `${BASE_URL}${path}`;
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.apiKey}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers as Record<string, string> | undefined),
+    };
+
     const res = await fetch(url, {
       ...options,
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-        ...options.headers,
-      },
+      headers,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -30,7 +41,11 @@ export class SonixClient {
           (body as Record<string, unknown>).message as string ||
           JSON.stringify(body);
       } catch {
-        message = res.statusText;
+        try {
+          message = await res.text();
+        } catch {
+          message = res.statusText || "Unknown error";
+        }
       }
       throw new Error(`${res.status}: ${message}`);
     }
@@ -40,7 +55,7 @@ export class SonixClient {
 
   private buildQuery(params: Record<string, string | number | undefined>): string {
     const entries = Object.entries(params).filter(
-      ([, v]) => v !== undefined
+      ([, v]) => v !== undefined && v !== ""
     ) as [string, string | number][];
     if (entries.length === 0) return "";
     return "?" + new URLSearchParams(
@@ -59,7 +74,7 @@ export class SonixClient {
   }
 
   async getMedia(id: string): Promise<unknown> {
-    const res = await this.request(`/media/${id}`);
+    const res = await this.request(`/media/${encodeURIComponent(id)}`);
     return res.json();
   }
 
@@ -83,9 +98,10 @@ export class SonixClient {
     format: "text" | "json" | "srt" | "vtt"
   ): Promise<string> {
     const ext = format === "text" ? "" : `.${format}`;
-    const res = await this.request(`/media/${id}/transcript${ext}`, {
-      headers: format === "text" ? { Accept: "text/plain" } : {},
-    });
+    const res = await this.request(
+      `/media/${encodeURIComponent(id)}/transcript${ext}`,
+      { headers: { Accept: ACCEPT_HEADERS[format] } }
+    );
     if (format === "json") {
       const data = await res.json();
       return JSON.stringify(data, null, 2);
@@ -104,7 +120,7 @@ export class SonixClient {
   }
 
   async deleteMedia(id: string): Promise<void> {
-    await this.request(`/media/${id}`, { method: "DELETE" });
+    await this.request(`/media/${encodeURIComponent(id)}`, { method: "DELETE" });
   }
 
   async updateMedia(
@@ -115,7 +131,7 @@ export class SonixClient {
       folder_id?: string;
     }
   ): Promise<unknown> {
-    const res = await this.request(`/media/${id}`, {
+    const res = await this.request(`/media/${encodeURIComponent(id)}`, {
       method: "PUT",
       body: JSON.stringify(params),
     });
@@ -130,10 +146,10 @@ export class SonixClient {
       sentence_count?: number;
     }
   ): Promise<unknown> {
-    const res = await this.request(`/media/${id}/summarizations`, {
-      method: "POST",
-      body: JSON.stringify(params),
-    });
+    const res = await this.request(
+      `/media/${encodeURIComponent(id)}/summarizations`,
+      { method: "POST", body: JSON.stringify(params) }
+    );
     return res.json();
   }
 
@@ -154,10 +170,10 @@ export class SonixClient {
     id: string,
     language: string
   ): Promise<unknown> {
-    const res = await this.request(`/media/${id}/translations`, {
-      method: "POST",
-      body: JSON.stringify({ language }),
-    });
+    const res = await this.request(
+      `/media/${encodeURIComponent(id)}/translations`,
+      { method: "POST", body: JSON.stringify({ language }) }
+    );
     return res.json();
   }
 
@@ -168,8 +184,8 @@ export class SonixClient {
   ): Promise<string> {
     const ext = format === "text" ? "" : `.${format}`;
     const res = await this.request(
-      `/media/${id}/translations/${language}/transcript${ext}`,
-      { headers: format === "text" ? { Accept: "text/plain" } : {} }
+      `/media/${encodeURIComponent(id)}/translations/${encodeURIComponent(language)}/transcript${ext}`,
+      { headers: { Accept: ACCEPT_HEADERS[format] } }
     );
     if (format === "json") {
       const data = await res.json();
