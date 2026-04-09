@@ -48,10 +48,12 @@ async function startStdio() {
 interface Session {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
+  apiKey: string;
   lastActivity: number;
 }
 
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || "100", 10);
 
 async function startHttp() {
   const port = parseInt(process.env.PORT || "3000", 10);
@@ -67,24 +69,43 @@ async function startHttp() {
       if (now - session.lastActivity > SESSION_TTL_MS) {
         session.transport.close();
         sessions.delete(sid);
-        console.log(`Session ${sid} evicted (idle ${SESSION_TTL_MS / 1000}s)`);
+        console.log(`Session evicted (idle ${SESSION_TTL_MS / 1000}s), ${sessions.size} remaining`);
       }
     }
   }, 5 * 60 * 1000);
 
+  function extractApiKey(req: express.Request): string | undefined {
+    const authHeader = req.headers.authorization;
+    return authHeader?.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : process.env.SONIX_API_KEY;
+  }
+
+  function verifySession(req: express.Request, res: express.Response): Session | null {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !sessions.has(sessionId)) {
+      res.status(400).json({ error: "Invalid or missing session ID" });
+      return null;
+    }
+    const session = sessions.get(sessionId)!;
+    const apiKey = extractApiKey(req);
+    if (apiKey !== session.apiKey) {
+      res.status(401).json({ error: "Unauthorized: API key does not match session" });
+      return null;
+    }
+    session.lastActivity = Date.now();
+    return session;
+  }
+
   app.post("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-    if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
+    if (sessionId) {
+      const session = verifySession(req, res);
+      if (!session) return;
       await session.transport.handleRequest(req, res, req.body);
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      const authHeader = req.headers.authorization;
-      const apiKey =
-        authHeader?.startsWith("Bearer ")
-          ? authHeader.slice(7)
-          : process.env.SONIX_API_KEY;
+    } else if (isInitializeRequest(req.body)) {
+      const apiKey = extractApiKey(req);
 
       if (!apiKey) {
         res.status(401).json({
@@ -95,18 +116,22 @@ async function startHttp() {
         return;
       }
 
+      if (sessions.size >= MAX_SESSIONS) {
+        res.status(503).json({ error: "Server at capacity. Try again later." });
+        return;
+      }
+
       const client = new SonixClient(apiKey);
       const server = createServer(client);
       const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid: string) => {
-          sessions.set(sid, { transport, server, lastActivity: Date.now() });
+          sessions.set(sid, { transport, server, apiKey, lastActivity: Date.now() });
         },
       });
       transport.onclose = () => {
         if (transport.sessionId) {
           sessions.delete(transport.sessionId);
-          console.log(`Session ${transport.sessionId} closed`);
         }
       };
       await server.connect(transport);
@@ -117,23 +142,15 @@ async function startHttp() {
   });
 
   app.get("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
-      await session.transport.handleRequest(req, res);
-    } else {
-      res.status(400).json({ error: "Invalid or missing session ID" });
-    }
+    const session = verifySession(req, res);
+    if (!session) return;
+    await session.transport.handleRequest(req, res);
   });
 
   app.delete("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (sessionId && sessions.has(sessionId)) {
-      await sessions.get(sessionId)!.transport.handleRequest(req, res);
-    } else {
-      res.status(400).json({ error: "Invalid or missing session ID" });
-    }
+    const session = verifySession(req, res);
+    if (!session) return;
+    await session.transport.handleRequest(req, res);
   });
 
   app.get("/health", (_req, res) => {
