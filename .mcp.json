@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sonix": {
+      "command": "node",
+      "args": ["/Users/tcc-m4-air/Code/mcp_sonix/dist/index.js"],
+      "env": {
+        "SONIX_API_KEY": "${SONIX_API_KEY}"
+      }
+    }
+  }
+}
