@@ -11,18 +11,7 @@ import express from "express";
 import { SonixClient } from "./sonix-client.js";
 import { registerTools } from "./tools.js";
 
-const apiKey = process.env.SONIX_API_KEY;
-if (!apiKey) {
-  console.error(
-    "Error: SONIX_API_KEY environment variable is required.\n" +
-      "Get your API key from https://my.sonix.ai/api"
-  );
-  process.exit(1);
-}
-
-const client = new SonixClient(apiKey);
-
-function createServer(): McpServer {
+function createServer(client: SonixClient): McpServer {
   const server = new McpServer(
     { name: "mcp-server-sonix", version: "1.0.0" },
     {
@@ -40,7 +29,17 @@ function createServer(): McpServer {
 }
 
 async function startStdio() {
-  const server = createServer();
+  const apiKey = process.env.SONIX_API_KEY;
+  if (!apiKey) {
+    console.error(
+      "Error: SONIX_API_KEY environment variable is required for stdio mode.\n" +
+        "Get your API key from https://my.sonix.ai/api"
+    );
+    process.exit(1);
+  }
+
+  const client = new SonixClient(apiKey);
+  const server = createServer(client);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Sonix MCP Server running on stdio");
@@ -51,23 +50,45 @@ async function startHttp() {
   const app = express();
   app.use(express.json());
 
-  // Store transports by session ID
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+  // Store transports and clients by session ID
+  const sessions = new Map<string, {
+    transport: StreamableHTTPServerTransport;
+  }>();
 
   app.post("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-    if (sessionId && transports.has(sessionId)) {
-      await transports.get(sessionId)!.handleRequest(req, res, req.body);
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId)!;
+      await session.transport.handleRequest(req, res, req.body);
     } else if (!sessionId && isInitializeRequest(req.body)) {
+      // Extract API key from Authorization header
+      const authHeader = req.headers.authorization;
+      const apiKey =
+        authHeader?.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : process.env.SONIX_API_KEY;
+
+      if (!apiKey) {
+        res.status(401).json({
+          error:
+            "Missing API key. Provide via Authorization: Bearer <key> header, " +
+            "or set SONIX_API_KEY on the server.",
+        });
+        return;
+      }
+
+      const client = new SonixClient(apiKey);
       const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (sid: string) => { transports.set(sid, transport); },
+        onsessioninitialized: (sid: string) => {
+          sessions.set(sid, { transport });
+        },
       });
       transport.onclose = () => {
-        if (transport.sessionId) transports.delete(transport.sessionId);
+        if (transport.sessionId) sessions.delete(transport.sessionId);
       };
-      const server = createServer();
+      const server = createServer(client);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } else {
@@ -77,8 +98,8 @@ async function startHttp() {
 
   app.get("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (sessionId && transports.has(sessionId)) {
-      await transports.get(sessionId)!.handleRequest(req, res);
+    if (sessionId && sessions.has(sessionId)) {
+      await sessions.get(sessionId)!.transport.handleRequest(req, res);
     } else {
       res.status(400).json({ error: "Invalid or missing session ID" });
     }
@@ -86,8 +107,8 @@ async function startHttp() {
 
   app.delete("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (sessionId && transports.has(sessionId)) {
-      await transports.get(sessionId)!.handleRequest(req, res);
+    if (sessionId && sessions.has(sessionId)) {
+      await sessions.get(sessionId)!.transport.handleRequest(req, res);
     } else {
       res.status(400).json({ error: "Invalid or missing session ID" });
     }
@@ -102,9 +123,9 @@ async function startHttp() {
   });
 }
 
-const transport = process.env.TRANSPORT || "stdio";
+const mode = process.env.TRANSPORT || "stdio";
 
-if (transport === "http") {
+if (mode === "http") {
   startHttp().catch((error) => {
     console.error("Fatal error:", error);
     process.exit(1);
