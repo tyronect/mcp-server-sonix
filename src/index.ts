@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -8,8 +8,21 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { SonixClient } from "./sonix-client.js";
 import { registerTools } from "./tools.js";
+
+// --- Structured logging ---
+
+function log(event: string, data: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
+}
+
+function sessionHash(sid: string): string {
+  return createHash("sha256").update(sid).digest("hex").slice(0, 8);
+}
+
+// --- Server factory ---
 
 function createServer(client: SonixClient): McpServer {
   const server = new McpServer(
@@ -28,6 +41,8 @@ function createServer(client: SonixClient): McpServer {
   return server;
 }
 
+// --- Stdio mode ---
+
 async function startStdio() {
   const apiKey = process.env.SONIX_API_KEY;
   if (!apiKey) {
@@ -45,6 +60,8 @@ async function startStdio() {
   console.error("Sonix MCP Server running on stdio");
 }
 
+// --- HTTP mode ---
+
 interface Session {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
@@ -60,25 +77,55 @@ async function startHttp() {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
+  // CORS — restrictive by default, configurable via CORS_ORIGIN env var
+  const corsOrigin = process.env.CORS_ORIGIN || "";
+  app.use((_req, res, next) => {
+    if (corsOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Accept");
+      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    }
+    next();
+  });
+  app.options("/mcp", (_req, res) => res.status(204).end());
+
+  // Rate limiting
+  const globalLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 60,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Too many requests. Try again later." },
+  });
+  const initLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 5,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Too many new sessions. Try again later." },
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? "unknown"),
+  });
+  app.use("/mcp", globalLimiter);
+
   const sessions = new Map<string, Session>();
 
-  // Evict stale sessions every 5 minutes
+  // Evict stale sessions every 1 minute
   setInterval(() => {
     const now = Date.now();
     for (const [sid, session] of sessions) {
       if (now - session.lastActivity > SESSION_TTL_MS) {
         session.transport.close();
         sessions.delete(sid);
-        console.log(`Session evicted (idle ${SESSION_TTL_MS / 1000}s), ${sessions.size} remaining`);
+        log("session_evicted", { remaining: sessions.size });
       }
     }
-  }, 5 * 60 * 1000);
+  }, 60 * 1000);
 
   function extractApiKey(req: express.Request): string | undefined {
     const authHeader = req.headers.authorization;
-    return authHeader?.startsWith("Bearer ")
-      ? authHeader.slice(7)
-      : process.env.SONIX_API_KEY;
+    if (!authHeader?.startsWith("Bearer ")) return undefined;
+    return authHeader.slice(7);
   }
 
   function verifySession(req: express.Request, res: express.Response): Session | null {
@@ -90,6 +137,7 @@ async function startHttp() {
     const session = sessions.get(sessionId)!;
     const apiKey = extractApiKey(req);
     if (apiKey !== session.apiKey) {
+      log("auth_failure", { ip: req.ip });
       res.status(401).json({ error: "Unauthorized: API key does not match session" });
       return null;
     }
@@ -105,18 +153,22 @@ async function startHttp() {
       if (!session) return;
       await session.transport.handleRequest(req, res, req.body);
     } else if (isInitializeRequest(req.body)) {
+      // Apply stricter rate limit for session creation
+      await new Promise<void>((resolve) => initLimiter(req, res, () => resolve()));
+      if (res.headersSent) return;
+
       const apiKey = extractApiKey(req);
 
       if (!apiKey) {
+        log("auth_failure", { ip: req.ip, reason: "missing_key" });
         res.status(401).json({
-          error:
-            "Missing API key. Provide via Authorization: Bearer <key> header, " +
-            "or set SONIX_API_KEY on the server.",
+          error: "Missing API key. Provide via Authorization: Bearer <key> header.",
         });
         return;
       }
 
       if (sessions.size >= MAX_SESSIONS) {
+        log("session_rejected", { ip: req.ip, reason: "at_capacity" });
         res.status(503).json({ error: "Server at capacity. Try again later." });
         return;
       }
@@ -127,11 +179,13 @@ async function startHttp() {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid: string) => {
           sessions.set(sid, { transport, server, apiKey, lastActivity: Date.now() });
+          log("session_created", { ip: req.ip, sh: sessionHash(sid), total: sessions.size });
         },
       });
       transport.onclose = () => {
         if (transport.sessionId) {
           sessions.delete(transport.sessionId);
+          log("session_closed", { remaining: sessions.size });
         }
       };
       await server.connect(transport);
@@ -154,17 +208,15 @@ async function startHttp() {
   });
 
   app.get("/health", (_req, res) => {
-    res.json({
-      status: "ok",
-      server: "mcp-server-sonix",
-      activeSessions: sessions.size,
-    });
+    res.json({ status: "ok" });
   });
 
   app.listen(port, () => {
-    console.log(`Sonix MCP Server running on http://0.0.0.0:${port}/mcp`);
+    log("server_started", { port, maxSessions: MAX_SESSIONS });
   });
 }
+
+// --- Entry point ---
 
 const mode = process.env.TRANSPORT || "stdio";
 
