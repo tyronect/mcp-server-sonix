@@ -1,5 +1,6 @@
 const BASE_URL = "https://api.sonix.ai/v1";
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 const ACCEPT_HEADERS: Record<string, string> = {
   text: "text/plain",
@@ -53,6 +54,30 @@ export class SonixClient {
     return res;
   }
 
+  private async readBody(res: Response): Promise<string> {
+    const contentLength = res.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_BYTES) {
+      throw new Error("Response too large");
+    }
+    const reader = res.body?.getReader();
+    if (!reader) return res.text();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_RESPONSE_BYTES) {
+        reader.cancel();
+        throw new Error("Response too large (exceeded 10MB limit)");
+      }
+      chunks.push(value);
+    }
+    return new TextDecoder().decode(
+      chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)
+    );
+  }
+
   private buildQuery(params: Record<string, string | number | undefined>): string {
     const entries = Object.entries(params).filter(
       ([, v]) => v !== undefined && v !== ""
@@ -102,11 +127,12 @@ export class SonixClient {
       `/media/${encodeURIComponent(id)}/transcript${ext}`,
       { headers: { Accept: ACCEPT_HEADERS[format] } }
     );
+    const body = await this.readBody(res);
     if (format === "json") {
-      const data = await res.json();
+      const data = JSON.parse(body);
       return JSON.stringify(data, null, 2);
     }
-    return res.text();
+    return body;
   }
 
   async searchMedia(params: {
@@ -187,10 +213,11 @@ export class SonixClient {
       `/media/${encodeURIComponent(id)}/translations/${encodeURIComponent(language)}/transcript${ext}`,
       { headers: { Accept: ACCEPT_HEADERS[format] } }
     );
+    const body = await this.readBody(res);
     if (format === "json") {
-      const data = await res.json();
+      const data = JSON.parse(body);
       return JSON.stringify(data, null, 2);
     }
-    return res.text();
+    return body;
   }
 }
