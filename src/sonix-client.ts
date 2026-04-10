@@ -9,6 +9,9 @@ const ACCEPT_HEADERS: Record<string, string> = {
   vtt: "text/vtt",
 };
 
+// Methods return Promise<unknown> because responses are passed straight to
+// JSON.stringify in the tools layer. Add typed interfaces here if the codebase
+// grows or tools need to branch on response fields.
 export class SonixClient {
   private apiKey: string;
 
@@ -54,6 +57,9 @@ export class SonixClient {
     return res;
   }
 
+  // Reads the response body with a size limit to prevent OOM from large transcripts.
+  // Uses streaming rather than res.arrayBuffer() so we can abort mid-stream for
+  // responses that lack a Content-Length header (common with chunked transfer).
   private async readBody(res: Response): Promise<string> {
     const contentLength = res.headers.get("content-length");
     if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_BYTES) {

@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+// zod v4 API via subpath export (available since zod@3.24), required by MCP SDK for Standard Schema
 import * as z from "zod/v4";
 import type { SonixClient } from "./sonix-client.js";
 

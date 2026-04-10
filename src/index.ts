@@ -72,16 +72,36 @@ interface Session {
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || "100", 10);
 
+// Shared handler for GET/DELETE — both just verify session and forward to transport
+async function handleSessionRequest(
+  method: string,
+  sessions: Map<string, Session>,
+  verifySession: (req: express.Request, res: express.Response) => Session | null,
+  req: express.Request,
+  res: express.Response
+) {
+  try {
+    const session = verifySession(req, res);
+    if (!session) return;
+    await session.transport.handleRequest(req, res);
+  } catch (err) {
+    log("handler_error", { method, err: String(err) });
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+}
+
 async function startHttp() {
   const port = parseInt(process.env.PORT || "3000", 10);
   const app = express();
 
-  // Fix #2: trust proxy for correct req.ip behind Railway's load balancer
+  // Required behind Railway's load balancer so req.ip reflects the real client
   app.set("trust proxy", 1);
 
   app.use(express.json({ limit: "1mb" }));
 
-  // CORS — restrictive by default, configurable via CORS_ORIGIN env var
+  // CORS — blocked by default, set CORS_ORIGIN env var to allow specific origins
   const corsOrigin = process.env.CORS_ORIGIN || "";
   app.use((_req, res, next) => {
     if (corsOrigin) {
@@ -94,7 +114,7 @@ async function startHttp() {
   });
   app.options("/mcp", (_req, res) => res.status(204).end());
 
-  // Rate limiting — global limit for all /mcp requests
+  // 60 requests/min per IP across all /mcp routes
   const globalLimiter = rateLimit({
     windowMs: 60 * 1000,
     limit: 60,
@@ -103,8 +123,7 @@ async function startHttp() {
     message: { error: "Too many requests. Try again later." },
   });
 
-  // Fix #1: init rate limiter as proper middleware on a sub-path
-  // Applied only to POST /mcp/init — we route init requests there internally
+  // 5 new sessions/min per IP — applied only to initialize requests
   const initLimiter = rateLimit({
     windowMs: 60 * 1000,
     limit: 5,
@@ -117,7 +136,8 @@ async function startHttp() {
 
   const sessions = new Map<string, Session>();
 
-  // Fix #4: evict stale sessions every 1 minute, catch close errors
+  // Evict idle sessions every minute. Catches transport.close() errors
+  // to prevent the eviction loop from dying on a bad session.
   setInterval(() => {
     const now = Date.now();
     for (const [sid, session] of sessions) {
@@ -137,7 +157,6 @@ async function startHttp() {
     return authHeader.slice(7);
   }
 
-  // Fix #7: use .get() and check for undefined instead of has() + get()!
   function verifySession(req: express.Request, res: express.Response): Session | null {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (!sessionId) {
@@ -159,7 +178,6 @@ async function startHttp() {
     return session;
   }
 
-  // Fix #3: wrap all route handlers in try/catch
   app.post("/mcp", async (req, res) => {
     try {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -169,14 +187,18 @@ async function startHttp() {
         if (!session) return;
         await session.transport.handleRequest(req, res, req.body);
       } else if (isInitializeRequest(req.body)) {
-        // Fix #1: apply init rate limit as a proper middleware call that always resolves
-        const limited = await new Promise<boolean>((resolve) => {
-          initLimiter(req, res, () => resolve(false));
-          // If rate limited, express-rate-limit sends 429 and never calls next.
-          // Detect this by listening for the response to finish.
-          res.on("finish", () => resolve(true));
+        // Apply init rate limit. express-rate-limit calls next() when allowed,
+        // or sends 429 and never calls next(). We use res.once("finish") to
+        // detect the 429 case so the Promise always resolves.
+        const allowed = await new Promise<boolean>((resolve) => {
+          const onFinish = () => resolve(false);
+          res.once("finish", onFinish);
+          initLimiter(req, res, () => {
+            res.removeListener("finish", onFinish);
+            resolve(true);
+          });
         });
-        if (limited) return;
+        if (!allowed) return;
 
         const apiKey = extractApiKey(req);
 
@@ -194,7 +216,7 @@ async function startHttp() {
           return;
         }
 
-        // Fix #5: validate API key before allocating session
+        // Validate API key against Sonix before allocating session resources
         const client = new SonixClient(apiKey);
         try {
           await client.listMedia({ page: 1 });
@@ -231,31 +253,8 @@ async function startHttp() {
     }
   });
 
-  app.get("/mcp", async (req, res) => {
-    try {
-      const session = verifySession(req, res);
-      if (!session) return;
-      await session.transport.handleRequest(req, res);
-    } catch (err) {
-      log("handler_error", { method: "GET", err: String(err) });
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Internal server error" });
-      }
-    }
-  });
-
-  app.delete("/mcp", async (req, res) => {
-    try {
-      const session = verifySession(req, res);
-      if (!session) return;
-      await session.transport.handleRequest(req, res);
-    } catch (err) {
-      log("handler_error", { method: "DELETE", err: String(err) });
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Internal server error" });
-      }
-    }
-  });
+  app.get("/mcp", (req, res) => handleSessionRequest("GET", sessions, verifySession, req, res));
+  app.delete("/mcp", (req, res) => handleSessionRequest("DELETE", sessions, verifySession, req, res));
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
