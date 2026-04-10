@@ -98,6 +98,7 @@ async function startHttp() {
 
   // Required behind Railway's load balancer so req.ip reflects the real client
   app.set("trust proxy", 1);
+  app.disable("x-powered-by");
 
   app.use(express.json({ limit: "1mb" }));
 
@@ -123,14 +124,31 @@ async function startHttp() {
     message: { error: "Too many requests. Try again later." },
   });
 
-  // 5 new sessions/min per IP — applied only to initialize requests
-  const initLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    limit: 5,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    message: { error: "Too many new sessions. Try again later." },
-  });
+  // 5 new sessions/min per IP — simple counter, not express-rate-limit middleware
+  // (express-rate-limit's middleware pattern doesn't work reliably when invoked
+  // manually inside a route handler — it sets headers but may not block requests)
+  const initAttempts = new Map<string, { count: number; resetAt: number }>();
+  const INIT_WINDOW_MS = 60 * 1000;
+  const INIT_LIMIT = 5;
+
+  function checkInitRateLimit(ip: string): boolean {
+    const now = Date.now();
+    const entry = initAttempts.get(ip);
+    if (!entry || now > entry.resetAt) {
+      initAttempts.set(ip, { count: 1, resetAt: now + INIT_WINDOW_MS });
+      return true;
+    }
+    entry.count++;
+    return entry.count <= INIT_LIMIT;
+  }
+
+  // Clean up stale init rate limit entries every 5 minutes
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of initAttempts) {
+      if (now > entry.resetAt) initAttempts.delete(ip);
+    }
+  }, 5 * 60 * 1000);
 
   app.use("/mcp", globalLimiter);
 
@@ -187,18 +205,13 @@ async function startHttp() {
         if (!session) return;
         await session.transport.handleRequest(req, res, req.body);
       } else if (isInitializeRequest(req.body)) {
-        // Apply init rate limit. express-rate-limit calls next() when allowed,
-        // or sends 429 and never calls next(). We use res.once("finish") to
-        // detect the 429 case so the Promise always resolves.
-        const allowed = await new Promise<boolean>((resolve) => {
-          const onFinish = () => resolve(false);
-          res.once("finish", onFinish);
-          initLimiter(req, res, () => {
-            res.removeListener("finish", onFinish);
-            resolve(true);
-          });
-        });
-        if (!allowed) return;
+        // Rate limit session creation per IP
+        const clientIp = req.ip || "unknown";
+        if (!checkInitRateLimit(clientIp)) {
+          log("rate_limited", { ip: clientIp, reason: "init_limit" });
+          res.status(429).json({ error: "Too many new sessions. Try again later." });
+          return;
+        }
 
         const apiKey = extractApiKey(req);
 
@@ -258,6 +271,14 @@ async function startHttp() {
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // Global error handler — prevents stack trace leaks from malformed JSON, oversized bodies, etc.
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    log("express_error", { err: String(err) });
+    if (!res.headersSent) {
+      res.status(400).json({ error: "Bad request" });
+    }
   });
 
   app.listen(port, () => {

@@ -25,6 +25,34 @@ function jsonResult(data: unknown): ToolResult {
   return textResult(JSON.stringify(data, null, 2));
 }
 
+// Block SSRF: reject private IPs, localhost, metadata endpoints, non-HTTP schemes
+function validatePublicUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`URL scheme "${parsed.protocol}" is not allowed. Use http:// or https://`);
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "0.0.0.0" ||
+    hostname === "[::1]" ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal") ||
+    /^10\./.test(hostname) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+    /^192\.168\./.test(hostname) ||
+    /^169\.254\./.test(hostname)
+  ) {
+    throw new Error("URL points to a private/internal address. Only public URLs are allowed.");
+  }
+}
+
 export function registerTools(server: McpServer, client: SonixClient) {
   // --- Media Tools ---
 
@@ -104,6 +132,8 @@ export function registerTools(server: McpServer, client: SonixClient) {
     },
     async ({ file_url, language, name, folder_id, keywords, callback_url }) => {
       try {
+        validatePublicUrl(file_url);
+        if (callback_url) validatePublicUrl(callback_url);
         const data = await client.uploadMedia({
           file_url,
           language,
